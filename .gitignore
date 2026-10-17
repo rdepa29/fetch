@@ -1,5 +1,7 @@
 fetch
+fetch.exe
 tests/shared
+tests/shared.exe
 debian/files
 debian/.debhelper/
 debian/fetch/

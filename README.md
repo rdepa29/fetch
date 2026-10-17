@@ -7,7 +7,7 @@ A donut.c-inspired fetch tool that spins your distro logo in 3D with live-updati
 Takes any ASCII/Unicode distro logo, turns each character into a point cloud
 based on its visual density, and renders it as a rotating 3D relief with
 Blinn-Phong shading. System info is gathered natively with no external
-dependencies. Works on Linux and macOS.
+dependencies. Works on Linux, macOS, and Windows.
 
 Based on [gentoo.c](https://github.com/areofyl/gentoo.c).
 
@@ -21,6 +21,27 @@ make
 Press any key to stop. The keypress passes through to the shell, so it
 works as a startup fetch. Ctrl-C works too (but is less cool). Click and
 drag the logo to rotate it by hand, release to fling it spinning.
+
+### Windows
+
+Build with MinGW-w64 (`gcc` on your `PATH`). Either run the batch script:
+
+```
+build.bat
+```
+
+or use `make` (MSYS2/Git Bash):
+
+```
+make
+make install
+```
+
+`build.bat` builds `fetch.exe`, then copies it to `%USERPROFILE%\bin` and
+ensures that directory is on your user `PATH`, so `fetch` works from
+anywhere. Open a new terminal afterwards if `PATH` was just updated.
+
+Click and drag as usual; press any key to stop.
 
 ## Install
 
