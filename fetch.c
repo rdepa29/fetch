@@ -535,6 +535,48 @@ static char *emit_clipped(char *p, char *end, const char *s, int max_cols) {
   return p;
 }
 
+// Fastfetch positions values with absolute column moves such as ESC[4G.
+// Shift those columns by the info block's offset so the captured lines keep
+// their alignment when drawn beside the spinning logo.
+static void translate_info_cursor(const char *src, char *dst, size_t dst_size,
+                                  int offset) {
+  size_t o = 0;
+  const char *p = src;
+  while (*p && o + 1 < dst_size) {
+    if (p[0] == '\033' && p[1] == '[') {
+      int i = 2;
+      int num = 0, has_num = 0;
+      while (p[i] >= '0' && p[i] <= '9') {
+        num = num * 10 + (p[i] - '0');
+        has_num = 1;
+        i++;
+      }
+      if (p[i] == 'G' && has_num) {
+        int n = snprintf(dst + o, dst_size - o, "\033[%dG", num + offset);
+        if (n > 0) {
+          if ((size_t)n >= dst_size - o)
+            o = dst_size - 1;
+          else
+            o += (size_t)n;
+        }
+        p += i + 1;
+        continue;
+      }
+      int j = i;
+      if (p[j])
+        j++;
+      if (o + (size_t)j < dst_size) {
+        memcpy(dst + o, p, j);
+        o += (size_t)j;
+      }
+      p += j;
+      continue;
+    }
+    dst[o++] = *p++;
+  }
+  dst[o] = '\0';
+}
+
 // Built-in ramps. The ASCII one bottoms out at '.' and ',', so dimly lit parts
 // of the logo turn into scattered specks and the shape reads as half there.
 // The block ramp keeps ink in every cell it covers, so the silhouette stays
@@ -1195,8 +1237,8 @@ static int PCOLOR[MAX_POINTS];
 static int POINT_COUNT = 0;
 
 // Fastfetch output storage
-#define MAX_FETCH_LINES 32
-#define MAX_LINE_LEN 512
+#define MAX_FETCH_LINES 64
+#define MAX_LINE_LEN 2048
 static char fetch_lines[MAX_FETCH_LINES][MAX_LINE_LEN];
 static int fetch_line_count = 0;
 
@@ -1243,6 +1285,7 @@ static char custom_label[MAX_CUSTOM][64];
 static char custom_value[MAX_CUSTOM][256];
 static int custom_count = 0;
 static int is_refresh_pass = 0;     // 1 during the animation refresh tick
+static int info_from_fastfetch = 0; // 1 when info comes from fastfetch output
 static char label_color[16] = "35"; // default magenta
 static int config_height = 0;       // 0 = auto (match info lines)
 static float size_scale = 1.0f;
@@ -1574,6 +1617,254 @@ static void add_line(const char *line) {
   strncpy(fetch_lines[fetch_line_count], line, MAX_LINE_LEN - 1);
   fetch_lines[fetch_line_count][MAX_LINE_LEN - 1] = '\0';
   fetch_line_count++;
+}
+
+static void repair_fastfetch_encoding(char *s) {
+  static const struct {
+    const char *bad;
+    const char *good;
+  } map[] = {
+      {"\xC3\xA2\xE2\x80\x9D\xE2\x82\xAC", "\xE2\x94\x80"},
+      {"\xC3\xA2\xE2\x80\x9D\xE2\x80\x9A", "\xE2\x94\x82"},
+      {"\xC3\xA2\xE2\x80\x9D\xC5\x92", "\xE2\x94\x8C"},
+      {"\xC3\xA2\xE2\x80\x9D\xC2\x90", "\xE2\x94\x90"},
+      {"\xC3\xA2\xE2\x80\x9D\xE2\x80\x9D", "\xE2\x94\x94"},
+      {"\xC3\xA2\xE2\x80\x9D\xCB\x9C", "\xE2\x94\x98"},
+  };
+  char out[MAX_LINE_LEN];
+  size_t oi = 0;
+  for (size_t i = 0; s[i] != '\0';) {
+    int matched = 0;
+    for (size_t m = 0; m < sizeof(map) / sizeof(map[0]); m++) {
+      size_t bad_len = strlen(map[m].bad);
+      if (strncmp(s + i, map[m].bad, bad_len) == 0) {
+        size_t good_len = strlen(map[m].good);
+        if (oi + good_len < sizeof(out)) {
+          memcpy(out + oi, map[m].good, good_len);
+          oi += good_len;
+        }
+        i += bad_len;
+        matched = 1;
+        break;
+      }
+    }
+    if (!matched) {
+      if (oi + 1 < sizeof(out))
+        out[oi++] = s[i];
+      i++;
+    }
+  }
+  out[oi] = '\0';
+  memcpy(s, out, oi + 1);
+}
+
+// Capture fastfetch's rendered config (boxes, icons, colors) with its logo
+// disabled. The spinning logo stays in this program; everything else comes
+// from fastfetch.
+static int load_fastfetch_info(void) {
+  FILE *fp = popen("fastfetch --logo none --pipe false " REDIR_ERR, "r");
+  if (!fp)
+    return 0;
+
+  char buf[MAX_LINE_LEN];
+  while (fgets(buf, sizeof(buf), fp)) {
+    int len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+      buf[--len] = '\0';
+    if (len == 0 && fetch_line_count == 0)
+      continue;
+    repair_fastfetch_encoding(buf);
+    add_line(buf);
+  }
+  pclose(fp);
+
+  while (fetch_line_count > 0 && fetch_lines[fetch_line_count - 1][0] == '\0')
+    fetch_line_count--;
+
+  if (fetch_line_count == 0)
+    return 0;
+
+  info_from_fastfetch = 1;
+  return 1;
+}
+
+static int ff_cpu_usage_line = -1;
+static int ff_memory_line = -1;
+
+static void find_fastfetch_live_lines(void) {
+  ff_cpu_usage_line = -1;
+  ff_memory_line = -1;
+  for (int i = 0; i < fetch_line_count; i++) {
+    const char *line = fetch_lines[i];
+    if (ff_cpu_usage_line < 0 && strstr(line, "peak") && strstr(line, "%"))
+      ff_cpu_usage_line = i;
+    if (ff_memory_line < 0 && strstr(line, "GiB /") &&
+        strstr(line, "GiB (") && !strstr(line, "C:\\"))
+      ff_memory_line = i;
+  }
+}
+
+static void replace_fastfetch_value(int idx, const char *value) {
+  if (idx < 0 || idx >= fetch_line_count)
+    return;
+  const char *line = fetch_lines[idx];
+  const char *start = strstr(line, "\x1b[38;2;255;255;255m");
+  if (!start)
+    return;
+  start += strlen("\x1b[38;2;255;255;255m");
+  const char *end = strstr(start, "\x1b[38;2;143;162;132m \xE2\x94\x82");
+  if (!end)
+    return;
+
+  char padded[64];
+  int vlen = (int)strlen(value);
+  if (vlen > 50)
+    vlen = 50;
+  memcpy(padded, value, vlen);
+  memset(padded + vlen, ' ', 50 - vlen);
+  padded[50] = '\0';
+
+  size_t prefix_len = (size_t)(start - line);
+  size_t suffix_len = strlen(end);
+  if (prefix_len + 50 + suffix_len + 1 > MAX_LINE_LEN)
+    return;
+
+  char out[MAX_LINE_LEN];
+  memcpy(out, line, prefix_len);
+  memcpy(out + prefix_len, padded, 50);
+  memcpy(out + prefix_len + 50, end, suffix_len + 1);
+  memcpy(fetch_lines[idx], out, prefix_len + 50 + suffix_len + 1);
+}
+
+#ifdef _WIN32
+static int native_cpu_usage(void) {
+  static ULONGLONG prev_idle, prev_kernel, prev_user;
+  static int have_prev = 0;
+  FILETIME idle_ft, kernel_ft, user_ft;
+  if (!GetSystemTimes(&idle_ft, &kernel_ft, &user_ft))
+    return -1;
+  ULARGE_INTEGER idle, kernel, user;
+  idle.LowPart = idle_ft.dwLowDateTime;
+  idle.HighPart = idle_ft.dwHighDateTime;
+  kernel.LowPart = kernel_ft.dwLowDateTime;
+  kernel.HighPart = kernel_ft.dwHighDateTime;
+  user.LowPart = user_ft.dwLowDateTime;
+  user.HighPart = user_ft.dwHighDateTime;
+
+  if (!have_prev) {
+    prev_idle = idle.QuadPart;
+    prev_kernel = kernel.QuadPart;
+    prev_user = user.QuadPart;
+    have_prev = 1;
+    return -1;
+  }
+
+  ULONGLONG idle_delta = idle.QuadPart - prev_idle;
+  ULONGLONG kernel_delta = kernel.QuadPart - prev_kernel;
+  ULONGLONG user_delta = user.QuadPart - prev_user;
+  ULONGLONG total = kernel_delta + user_delta;
+  ULONGLONG busy = total > idle_delta ? total - idle_delta : 0;
+  prev_idle = idle.QuadPart;
+  prev_kernel = kernel.QuadPart;
+  prev_user = user.QuadPart;
+  if (total == 0)
+    return 0;
+  return (int)((busy * 100 + total / 2) / total);
+}
+#else
+static int native_cpu_usage(void) {
+  static unsigned long long prev_total, prev_idle;
+  static int have_prev = 0;
+  FILE *fp = fopen("/proc/stat", "r");
+  if (!fp)
+    return -1;
+  char line[256];
+  if (!fgets(line, sizeof(line), fp)) {
+    fclose(fp);
+    return -1;
+  }
+  fclose(fp);
+  unsigned long long user, nice, system, idle, iowait, irq, softirq, steal;
+  int n = sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &user,
+                 &nice, &system, &idle, &iowait, &irq, &softirq, &steal);
+  if (n < 4)
+    return -1;
+  unsigned long long total = user + nice + system + idle;
+  if (n > 4)
+    total += iowait;
+  if (n > 5)
+    total += irq;
+  if (n > 6)
+    total += softirq;
+  if (n > 7)
+    total += steal;
+  if (!have_prev) {
+    prev_total = total;
+    prev_idle = idle;
+    have_prev = 1;
+    return -1;
+  }
+  unsigned long long total_delta = total - prev_total;
+  unsigned long long idle_delta = idle - prev_idle;
+  prev_total = total;
+  prev_idle = idle;
+  if (total_delta == 0)
+    return 0;
+  return (int)((total_delta - idle_delta) * 100 / total_delta);
+}
+#endif
+
+static int native_memory(float *used_gib, float *total_gib, int *pct) {
+#ifdef _WIN32
+  MEMORYSTATUSEX ms;
+  ms.dwLength = sizeof(ms);
+  if (!GlobalMemoryStatusEx(&ms) || ms.ullTotalPhys == 0)
+    return 0;
+  *total_gib = (float)(ms.ullTotalPhys / 1073741824.0);
+  *used_gib = (float)((ms.ullTotalPhys - ms.ullAvailPhys) / 1073741824.0);
+  *pct = (int)((ms.ullTotalPhys - ms.ullAvailPhys) * 100 / ms.ullTotalPhys);
+  return 1;
+#else
+  FILE *fp = fopen("/proc/meminfo", "r");
+  if (!fp)
+    return 0;
+  unsigned long long total = 0, avail = 0;
+  char line[256];
+  while (fgets(line, sizeof(line), fp)) {
+    if (strncmp(line, "MemTotal:", 9) == 0)
+      sscanf(line + 9, " %llu", &total);
+    else if (strncmp(line, "MemAvailable:", 13) == 0)
+      sscanf(line + 13, " %llu", &avail);
+  }
+  fclose(fp);
+  if (total == 0)
+    return 0;
+  unsigned long long used = total > avail ? total - avail : 0;
+  *total_gib = (float)(total / 1048576.0);
+  *used_gib = (float)(used / 1048576.0);
+  *pct = (int)(used * 100 / total);
+  return 1;
+#endif
+}
+
+static void refresh_fastfetch_live_fields(void) {
+  static int cpu_peak = 0;
+  int usage = native_cpu_usage();
+  if (usage >= 0 && ff_cpu_usage_line >= 0) {
+    if (usage > cpu_peak)
+      cpu_peak = usage;
+    char value[64];
+    snprintf(value, sizeof(value), "%d%% usage | %d%% peak", usage, cpu_peak);
+    replace_fastfetch_value(ff_cpu_usage_line, value);
+  }
+
+  float used, total;
+  int pct;
+  if (ff_memory_line >= 0 && native_memory(&used, &total, &pct)) {
+    char value[64];
+    snprintf(value, sizeof(value), "%.2f GiB / %.2f GiB (%d%%)", used, total, pct);
+    replace_fastfetch_value(ff_memory_line, value);
+  }
 }
 
 // Format a labeled info line using the configured label color.
@@ -5208,28 +5499,34 @@ int main(int argc, char **argv) {
     field_line[i] = -1;
 
   if (show_info) {
-    gather_title();
-    for (int i = 0; i < field_count; i++) {
-      int id = field_order[i];
-      if (id == F_SEPARATOR) {
-        add_line("");
-      } else if (id >= F_CUSTOM_BASE && id < F_CUSTOM_BASE + MAX_CUSTOM) {
-        int ci = id - F_CUSTOM_BASE;
-        add_info(custom_label[ci], "%s", custom_value[ci]);
-      } else if (id == F_COLORS) {
-        add_line("");
-        add_line("\033[40m   \033[41m   \033[42m   \033[43m   "
-                 "\033[44m   \033[45m   \033[46m   \033[47m   \033[0m");
-        add_line("\033[100m   \033[101m   \033[102m   \033[103m   "
-                 "\033[104m   \033[105m   \033[106m   \033[107m   \033[0m");
-      } else if (id < F_COUNT && fns[id]) {
-        current_field = id;
-        fns[id]();
+    if (!load_fastfetch_info()) {
+      gather_title();
+      for (int i = 0; i < field_count; i++) {
+        int id = field_order[i];
+        if (id == F_SEPARATOR) {
+          add_line("");
+        } else if (id >= F_CUSTOM_BASE && id < F_CUSTOM_BASE + MAX_CUSTOM) {
+          int ci = id - F_CUSTOM_BASE;
+          add_info(custom_label[ci], "%s", custom_value[ci]);
+        } else if (id == F_COLORS) {
+          add_line("");
+          add_line("\033[40m   \033[41m   \033[42m   \033[43m   "
+                   "\033[44m   \033[45m   \033[46m   \033[47m   \033[0m");
+          add_line("\033[100m   \033[101m   \033[102m   \033[103m   "
+                   "\033[104m   \033[105m   \033[106m   \033[107m   \033[0m");
+        } else if (id < F_COUNT && fns[id]) {
+          current_field = id;
+          fns[id]();
+        }
       }
+      current_field = -1;
     }
-    current_field = -1;
   }
-  if (config_box)
+  if (info_from_fastfetch) {
+    find_fastfetch_live_lines();
+    (void)native_cpu_usage();
+  }
+  if (config_box && !info_from_fastfetch)
     box_wrap_lines();
   apply_layout(show_info);
 
@@ -5431,25 +5728,27 @@ int main(int argc, char **argv) {
       }
     }
     // Refresh fast dynamic fields every ~1 second (20 frames).
-    // Only uptime/memory/swap — they're pure /proc reads, no popen,
-    // so they don't hitch the animation. Battery/disk/ip use popen and
-    // stay static (user can restart to refresh those).
+    // Native reads only: no popen, so the animation does not hitch.
     if (show_info && frame > 0 && frame % 20 == 0) {
-      is_refresh_pass = 1;
-      if (field_line[F_UPTIME] >= 0) {
-        current_field = F_UPTIME;
-        gather_uptime();
+      if (info_from_fastfetch) {
+        refresh_fastfetch_live_fields();
+      } else {
+        is_refresh_pass = 1;
+        if (field_line[F_UPTIME] >= 0) {
+          current_field = F_UPTIME;
+          gather_uptime();
+        }
+        if (field_line[F_MEMORY] >= 0) {
+          current_field = F_MEMORY;
+          gather_memory();
+        }
+        if (field_line[F_SWAP] >= 0) {
+          current_field = F_SWAP;
+          gather_swap();
+        }
+        current_field = -1;
+        is_refresh_pass = 0;
       }
-      if (field_line[F_MEMORY] >= 0) {
-        current_field = F_MEMORY;
-        gather_memory();
-      }
-      if (field_line[F_SWAP] >= 0) {
-        current_field = F_SWAP;
-        gather_swap();
-      }
-      current_field = -1;
-      is_refresh_pass = 0;
     }
 
     clear_buf();
@@ -5617,7 +5916,14 @@ int main(int argc, char **argv) {
       if (!layout_stacked && fi >= 0 && fi < fetch_line_count &&
           p + GAP + 4 < end) {
         memset(p, ' ', GAP); p += GAP;
-        p = emit_clipped(p, end, fetch_lines[fi], info_clip_cols);
+        const char *info_line = fetch_lines[fi];
+        char info_buf[MAX_LINE_LEN];
+        if (info_from_fastfetch) {
+          translate_info_cursor(fetch_lines[fi], info_buf, sizeof(info_buf),
+                                left_padding + anim_width + GAP);
+          info_line = info_buf;
+        }
+        p = emit_clipped(p, end, info_line, info_clip_cols);
       }
 
       // Erase to end of line + newline
